@@ -1683,3 +1683,94 @@ input::placeholder {
     transition-duration: .01ms !important;
   }
 }
+
+/* =========================================
+   PRIVATE VAULT — MEDIA THUMBNAIL GALLERY
+   Tambahan: thumbnail foto/video + swipe horizontal
+========================================= */
+
+.media-gallery {
+  display: flex !important;
+  flex-wrap: nowrap !important;
+  gap: 18px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 2px 18px;
+  scroll-snap-type: x mandatory;
+  scroll-padding-left: 2px;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+
+.media-gallery .media-card {
+  flex: 0 0 245px;
+  min-width: 245px;
+  scroll-snap-align: start;
+  position: relative;
+}
+
+.media-gallery::-webkit-scrollbar {
+  height: 8px;
+}
+
+.media-gallery::-webkit-scrollbar-thumb {
+  background: rgba(130, 140, 165, 0.38);
+  border-radius: 20px;
+}
+
+.media-gallery::-webkit-scrollbar-track {
+  background: rgba(130, 140, 165, 0.10);
+  border-radius: 20px;
+}
+
+.media-thumb {
+  position: relative;
+  overflow: hidden;
+}
+
+.media-thumb.has-thumbnail {
+  background: #101522;
+}
+
+.media-thumbnail-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 170px;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+.thumbnail-status {
+  display: block;
+  margin-top: 10px;
+  font-size: 11px;
+  opacity: 0.72;
+}
+
+.video-play-overlay {
+  position: absolute;
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: white;
+  background: rgba(0, 0, 0, 0.58);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  pointer-events: none;
+}
+
+@media (max-width: 640px) {
+  .media-gallery {
+    gap: 12px;
+    margin-right: -4px;
+  }
+
+  .media-gallery .media-card {
+    flex-basis: min(76vw, 245px);
+    min-width: min(76vw, 245px);
+  }
+}

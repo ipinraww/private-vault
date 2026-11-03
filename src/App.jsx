@@ -854,11 +854,12 @@ function App() {
           )}
 
           {filtered.length ? (
-            <div className="media-grid">
+            <div className="media-grid media-gallery">
               {filtered.map(item => (
                 <MediaCard
                   key={item.id}
                   item={item}
+                  vaultKey={key}
                   onOpen={() => openPreview(item)}
                   onDelete={() => setDeleteTarget(item)}
                 />
@@ -1122,7 +1123,12 @@ function Stat({ icon: Icon, label, count, color }) {
   );
 }
 
-function MediaCard({ item, onOpen, onDelete }) {
+function MediaCard({ item, vaultKey, onOpen, onDelete }) {
+  const [thumbnailUrl, setThumbnailUrl] = useState('');
+  const [thumbnailState, setThumbnailState] = useState('loading');
+  const [isVisible, setIsVisible] = useState(false);
+  const cardRef = useRef(null);
+
   const Icon =
     item.type === 'photo'
       ? FileImage
@@ -1130,20 +1136,207 @@ function MediaCard({ item, onOpen, onDelete }) {
         ? FileVideo
         : FileAudio;
 
+  // Decrypt only when the card approaches the visible gallery area.
+  // Plaintext thumbnails exist only as temporary browser object URLs.
+  useEffect(() => {
+    const node = cardRef.current;
+    if (!node) {
+      setIsVisible(true);
+      return;
+    }
+
+    if (!('IntersectionObserver' in window)) {
+      setIsVisible(true);
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      entries => {
+        if (entries.some(entry => entry.isIntersecting)) {
+          setIsVisible(true);
+          observer.disconnect();
+        }
+      },
+      { root: null, rootMargin: '240px', threshold: 0.01 }
+    );
+
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!isVisible || !vaultKey || item.type === 'audio') return;
+
+    let cancelled = false;
+    let sourceUrl = '';
+
+    async function createThumbnail() {
+      setThumbnailState('loading');
+
+      try {
+        const rows = await getAllRecords();
+        if (cancelled) return;
+
+        const record = rows.find(row => row.id === item.id);
+        if (!record) throw new Error('File tidak ditemukan');
+
+        const bytes = await decryptBytes(record, vaultKey);
+        if (cancelled) return;
+
+        const blob = new Blob([bytes], {
+          type: record.mime || item.mime || 'application/octet-stream'
+        });
+
+        sourceUrl = URL.createObjectURL(blob);
+
+        if (item.type === 'photo') {
+          if (cancelled) return;
+          setThumbnailUrl(sourceUrl);
+          sourceUrl = '';
+          setThumbnailState('ready');
+          return;
+        }
+
+        // Extract one frame from the decrypted video in memory.
+        const video = document.createElement('video');
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = 'auto';
+        video.src = sourceUrl;
+
+        const waitFor = (target, eventName, errorName = 'error') =>
+          new Promise((resolve, reject) => {
+            const onReady = () => {
+              cleanup();
+              resolve();
+            };
+            const onError = () => {
+              cleanup();
+              reject(new Error('Browser tidak dapat membaca video ini.'));
+            };
+            const cleanup = () => {
+              target.removeEventListener(eventName, onReady);
+              target.removeEventListener(errorName, onError);
+            };
+            target.addEventListener(eventName, onReady, { once: true });
+            target.addEventListener(errorName, onError, { once: true });
+          });
+
+        await waitFor(video, 'loadeddata');
+
+        if (cancelled) {
+          video.removeAttribute('src');
+          video.load();
+          return;
+        }
+
+        // Move slightly into the video when possible so the frame is not black.
+        if (Number.isFinite(video.duration) && video.duration > 0.15) {
+          const seekTime = Math.min(0.15, video.duration / 2);
+          const seekPromise = waitFor(video, 'seeked');
+          try {
+            video.currentTime = seekTime;
+            await seekPromise;
+          } catch {
+            // Keep the first decoded frame if seeking is unsupported.
+          }
+        }
+
+        if (cancelled) {
+          video.removeAttribute('src');
+          video.load();
+          return;
+        }
+
+        const width = video.videoWidth || 640;
+        const height = video.videoHeight || 360;
+        const maxDimension = 960;
+        const scale = Math.min(1, maxDimension / Math.max(width, height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(width * scale));
+        canvas.height = Math.max(1, Math.round(height * scale));
+
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('Canvas tidak tersedia.');
+
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        const thumbnailBlob = await new Promise(resolve => {
+          canvas.toBlob(resolve, 'image/jpeg', 0.82);
+        });
+
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+
+        if (!thumbnailBlob) throw new Error('Gagal membuat thumbnail video.');
+
+        const frameUrl = URL.createObjectURL(thumbnailBlob);
+
+        if (cancelled) {
+          URL.revokeObjectURL(frameUrl);
+          return;
+        }
+
+        setThumbnailUrl(frameUrl);
+        setThumbnailState('ready');
+      } catch (error) {
+        if (!cancelled) setThumbnailState('error');
+      } finally {
+        if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+      }
+    }
+
+    createThumbnail();
+
+    return () => {
+      cancelled = true;
+      if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+    };
+  }, [isVisible, item.id, item.type, item.mime, vaultKey]);
+
+  useEffect(() => {
+    return () => {
+      if (thumbnailUrl) URL.revokeObjectURL(thumbnailUrl);
+    };
+  }, [thumbnailUrl]);
+
   return (
-    <article className="media-card">
+    <article className="media-card" ref={cardRef}>
       <button
-        className={`media-thumb ${item.type}`}
+        className={`media-thumb ${item.type} ${thumbnailUrl ? 'has-thumbnail' : ''}`}
         onClick={onOpen}
+        type="button"
+        aria-label={`Buka ${item.name}`}
       >
-        {item.type === 'photo' ? (
+        {thumbnailUrl && item.type === 'photo' ? (
+          <img
+            className="media-thumbnail-image"
+            src={thumbnailUrl}
+            alt={item.name}
+            loading="lazy"
+          />
+        ) : thumbnailUrl && item.type === 'video' ? (
+          <img
+            className="media-thumbnail-image"
+            src={thumbnailUrl}
+            alt={`Cuplikan video ${item.name}`}
+            loading="lazy"
+          />
+        ) : item.type === 'photo' ? (
           <div className="file-art photo-art">
             <ImageIcon size={34} />
+            <span className="thumbnail-status">
+              {thumbnailState === 'loading' ? 'Memuat foto...' : 'Preview tidak tersedia'}
+            </span>
           </div>
         ) : item.type === 'video' ? (
           <div className="file-art video-art">
             <Video size={36} />
             <span className="play-dot">▶</span>
+            <span className="thumbnail-status">
+              {thumbnailState === 'loading' ? 'Memuat cuplikan...' : 'Preview tidak tersedia'}
+            </span>
           </div>
         ) : (
           <div className="file-art audio-art">
@@ -1154,6 +1347,9 @@ function MediaCard({ item, onOpen, onDelete }) {
           </div>
         )}
 
+        {item.type === 'video' && thumbnailUrl && (
+          <span className="video-play-overlay">▶</span>
+        )}
         <span className="open-hint">Buka preview</span>
       </button>
 
@@ -1175,7 +1371,9 @@ function MediaCard({ item, onOpen, onDelete }) {
       <button
         className="delete-icon"
         onClick={onDelete}
+        type="button"
         title="Hapus file"
+        aria-label={`Hapus ${item.name}`}
       >
         <Trash2 size={16} />
       </button>
