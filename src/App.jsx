@@ -1,5 +1,6 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { supabase, isCloudConfigured } from './supabase';
 import {
   ShieldCheck, LockKeyhole, Image as ImageIcon, Video, Music2, Upload,
   Search, Trash2, LogOut, HardDrive, X, Eye, EyeOff, FileAudio, FileVideo,
@@ -63,12 +64,9 @@ function App() {
   const [previewUrl, setPreviewUrl] = useState('');
   const [deleteTarget, setDeleteTarget] = useState(null);
 
-  // SIDEBAR: buka dan tutup
   const [sidebarOpen, setSidebarOpen] = useState(true);
-
-  // FITUR TAMBAHAN: Pengaturan dan ubah password
   const [showSettings, setShowSettings] = useState(false);
-  const [showRecoveryInfo, setShowRecoveryInfo] = useState(false);
+
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
@@ -76,8 +74,445 @@ function App() {
   const [passwordError, setPasswordError] = useState('');
   const [passwordSuccess, setPasswordSuccess] = useState('');
 
+  // Akun Cloud terpisah dari password utama Vault.
+  const [cloudSession, setCloudSession] = useState(null);
+  const [cloudEmail, setCloudEmail] = useState('');
+  const [cloudPassword, setCloudPassword] = useState('');
+  const [cloudAuthBusy, setCloudAuthBusy] = useState(false);
+  const [cloudMessage, setCloudMessage] = useState('');
+  const [cloudSyncBusy, setCloudSyncBusy] = useState(false);
+  const [cloudProfileMismatch, setCloudProfileMismatch] = useState(false);
+  const [cloudProfileReady, setCloudProfileReady] = useState(true);
+
   const fileRef = useRef(null);
   const backupRef = useRef(null);
+  const galleryRef = useRef(null);
+
+  const galleryDrag = useRef({
+    active: false,
+    startX: 0,
+    startScrollLeft: 0,
+    moved: false
+  });
+
+  function handleGalleryPointerDown(event) {
+    if (event.pointerType !== 'mouse' || event.button !== 0) return;
+
+    const gallery = galleryRef.current;
+    if (!gallery) return;
+
+    galleryDrag.current = {
+      active: true,
+      startX: event.clientX,
+      startScrollLeft: gallery.scrollLeft,
+      moved: false
+    };
+  }
+
+  function handleGalleryPointerMove(event) {
+    const drag = galleryDrag.current;
+    const gallery = galleryRef.current;
+
+    if (!drag.active || !gallery) return;
+
+    const distance = event.clientX - drag.startX;
+
+    if (Math.abs(distance) > 5) {
+      drag.moved = true;
+      gallery.classList.add('is-dragging');
+      event.preventDefault();
+    }
+
+    if (drag.moved) {
+      gallery.scrollLeft = drag.startScrollLeft - distance;
+    }
+  }
+
+  function handleGalleryPointerEnd() {
+    galleryDrag.current.active = false;
+    galleryRef.current?.classList.remove('is-dragging');
+  }
+
+  function handleGalleryClickCapture(event) {
+    if (galleryDrag.current.moved) {
+      event.preventDefault();
+      event.stopPropagation();
+      galleryDrag.current.moved = false;
+    }
+  }
+
+  function moveGallery(direction) {
+    const gallery = galleryRef.current;
+    if (!gallery) return;
+
+    gallery.scrollBy({
+      left: direction * Math.max(300, gallery.clientWidth * 0.8),
+      behavior: 'smooth'
+    });
+  }
+
+  function bytesFromBase64(value) {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+
+    return bytes;
+  }
+
+  function base64FromBytes(bytes) {
+    let binary = '';
+    const chunk = 0x8000;
+
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+
+    return btoa(binary);
+  }
+
+  async function fetchCloudProfile(userId) {
+    if (!supabase || !userId) return null;
+
+    const { data, error } = await supabase
+      .from('vault_profiles')
+      .select('salt, verifier, created_at')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data?.salt || !data?.verifier) return null;
+
+    return {
+      salt: data.salt,
+      verifier: data.verifier,
+      createdAt: data.created_at || Date.now()
+    };
+  }
+
+  async function loadCloudProfile(userId) {
+    if (!supabase || !userId) return null;
+
+    try {
+      const remoteMeta = await fetchCloudProfile(userId);
+
+      if (!remoteMeta) return null;
+
+      const localMeta = (() => {
+        try {
+          return JSON.parse(localStorage.getItem(META_KEY));
+        } catch {
+          return null;
+        }
+      })();
+
+      if (!localMeta) {
+        const localRows = await getAllRecords();
+
+        if (localRows.length > 0) {
+          setCloudProfileMismatch(true);
+          setCloudMessage(
+            'Browser ini memiliki file lokal tetapi belum memiliki profil Vault yang cocok. Data lokal tidak ditimpa.'
+          );
+          return remoteMeta;
+        }
+
+        localStorage.setItem(META_KEY, JSON.stringify(remoteMeta));
+        setAuthMeta(remoteMeta);
+        setCloudProfileMismatch(false);
+        setCloudMessage('Profil Vault Cloud ditemukan.');
+      } else if (
+        JSON.stringify(localMeta.salt) !== JSON.stringify(remoteMeta.salt)
+      ) {
+        setCloudProfileMismatch(true);
+        setCloudMessage(
+          'Profil Vault lokal dan Cloud berbeda. Sinkronisasi diblokir.'
+        );
+      } else {
+        setCloudProfileMismatch(false);
+        setAuthMeta(localMeta);
+      }
+
+      return remoteMeta;
+    } catch (error) {
+      setCloudMessage(`Gagal membaca profil Cloud: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async function saveCloudProfile(userId, meta) {
+    if (!supabase || !userId || !meta) return;
+
+    const { error } = await supabase
+      .from('vault_profiles')
+      .upsert({
+        user_id: userId,
+        salt: meta.salt,
+        verifier: meta.verifier,
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'user_id'
+      });
+
+    if (error) throw error;
+  }
+
+  async function uploadEncryptedRecord(record, userId = cloudSession?.user?.id) {
+    if (!supabase || !userId) return;
+
+    const path = `${userId}/${record.id}.bin`;
+
+    const blob = new Blob(
+      [bytesFromBase64(record.data)],
+      { type: 'application/octet-stream' }
+    );
+
+    const { error: uploadError } = await supabase.storage
+      .from('vault-encrypted')
+      .upload(path, blob, {
+        contentType: 'application/octet-stream',
+        upsert: true
+      });
+
+    if (uploadError) throw uploadError;
+
+    const { error } = await supabase
+      .from('vault_files')
+      .upsert({
+        id: record.id,
+        user_id: userId,
+        name: record.name,
+        type: record.type,
+        size: record.size,
+        mime: record.mime,
+        storage_path: path,
+        iv: record.iv,
+        created_at: record.createdAt,
+        uploaded_at: new Date().toISOString()
+      }, {
+        onConflict: 'id'
+      });
+
+    if (error) throw error;
+  }
+
+  async function syncCloudFiles() {
+    if (!supabase || !cloudSession?.user?.id || !authMeta) return;
+
+    if (cloudProfileMismatch) {
+      setCloudMessage('Sinkronisasi diblokir karena profil Vault berbeda.');
+      return;
+    }
+
+    setCloudSyncBusy(true);
+
+    try {
+      const remoteMeta = await fetchCloudProfile(cloudSession.user.id);
+
+      if (
+        remoteMeta &&
+        JSON.stringify(remoteMeta.salt) !== JSON.stringify(authMeta.salt)
+      ) {
+        setCloudProfileMismatch(true);
+        throw new Error('Profil Vault Cloud berbeda dengan Vault lokal.');
+      }
+
+      if (!remoteMeta) {
+        await saveCloudProfile(cloudSession.user.id, authMeta);
+      }
+
+      const { data: remoteRows, error } = await supabase
+        .from('vault_files')
+        .select('id,name,type,size,mime,storage_path,iv,created_at')
+        .eq('user_id', cloudSession.user.id);
+
+      if (error) throw error;
+
+      const localRows = await getAllRecords();
+      const localIds = new Set(localRows.map(row => row.id));
+      const remoteIds = new Set((remoteRows || []).map(row => row.id));
+
+      let downloaded = 0;
+      let uploaded = 0;
+
+      for (const row of (remoteRows || [])) {
+        if (localIds.has(row.id)) continue;
+
+        const { data: fileBlob, error: downloadError } = await supabase.storage
+          .from('vault-encrypted')
+          .download(row.storage_path);
+
+        if (downloadError) throw downloadError;
+
+        const encryptedBytes = new Uint8Array(
+          await fileBlob.arrayBuffer()
+        );
+
+        await saveRecord({
+          id: row.id,
+          name: row.name,
+          type: row.type,
+          size: row.size,
+          mime: row.mime,
+          createdAt: Number(row.created_at),
+          iv: row.iv,
+          data: base64FromBytes(encryptedBytes)
+        });
+
+        downloaded++;
+      }
+
+      for (const row of localRows) {
+        if (remoteIds.has(row.id)) continue;
+
+        await uploadEncryptedRecord(row);
+        uploaded++;
+      }
+
+      await refreshRecords();
+
+      setCloudMessage(
+        `Sinkronisasi selesai. ${downloaded} file diunduh, ${uploaded} file diunggah.`
+      );
+    } catch (error) {
+      setCloudMessage(`Sinkronisasi gagal: ${error.message}`);
+    } finally {
+      setCloudSyncBusy(false);
+    }
+  }
+
+  async function signInCloud(event) {
+    event?.preventDefault();
+
+    if (!supabase) return;
+
+    setCloudAuthBusy(true);
+    setCloudMessage('');
+
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: cloudEmail.trim(),
+        password: cloudPassword
+      });
+
+      if (error) throw error;
+
+      setCloudSession(data.session);
+      setCloudPassword('');
+
+      await loadCloudProfile(data.user.id);
+
+      setCloudMessage('Berhasil masuk ke akun Cloud.');
+    } catch (error) {
+      setCloudMessage(`Gagal masuk: ${error.message}`);
+    } finally {
+      setCloudAuthBusy(false);
+    }
+  }
+
+  async function signUpCloud(event) {
+    event?.preventDefault();
+
+    if (!supabase) return;
+
+    if (!cloudEmail.trim() || !cloudPassword) {
+      setCloudMessage('Masukkan email dan password akun Cloud.');
+      return;
+    }
+
+    if (cloudPassword.length < 8) {
+      setCloudMessage('Password akun Cloud minimal 8 karakter.');
+      return;
+    }
+
+    setCloudAuthBusy(true);
+    setCloudMessage('');
+
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email: cloudEmail.trim(),
+        password: cloudPassword
+      });
+
+      if (error) throw error;
+
+      setCloudPassword('');
+
+      if (data.session && data.user) {
+        setCloudSession(data.session);
+        await loadCloudProfile(data.user.id);
+        setCloudMessage('Akun berhasil dibuat dan sudah masuk.');
+      } else {
+        setCloudMessage(
+          'Akun berhasil dibuat. Periksa email untuk konfirmasi.'
+        );
+      }
+    } catch (error) {
+      setCloudMessage(`Gagal membuat akun: ${error.message}`);
+    } finally {
+      setCloudAuthBusy(false);
+    }
+  }
+
+  async function signOutCloud() {
+    if (!supabase) return;
+
+    const { error } = await supabase.auth.signOut();
+
+    if (error) {
+      setCloudMessage(`Gagal keluar: ${error.message}`);
+    } else {
+      setCloudSession(null);
+      setCloudProfileMismatch(false);
+      setCloudMessage('Akun Cloud sudah keluar. File lokal tetap ada.');
+    }
+  }
+
+  useEffect(() => {
+    if (!isCloudConfigured || !supabase) return;
+
+    let alive = true;
+
+    async function initializeCloud() {
+      try {
+        const { data, error } = await supabase.auth.getSession();
+
+        if (error) throw error;
+        if (!alive) return;
+
+        const session = data.session || null;
+        setCloudSession(session);
+
+        if (session?.user?.id) {
+          await loadCloudProfile(session.user.id);
+        }
+      } catch (error) {
+        if (alive) {
+          setCloudMessage(`Gagal memeriksa sesi Cloud: ${error.message}`);
+        }
+      }
+    }
+
+    initializeCloud();
+
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      (_event, session) => {
+        if (!alive) return;
+        setCloudSession(session || null);
+
+        if (!session) {
+          setCloudProfileMismatch(false);
+        }
+      }
+    );
+
+    return () => {
+      alive = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
 
   const isSetup = !authMeta;
 
@@ -94,11 +529,13 @@ function App() {
     };
   }, [previewUrl]);
 
+  // LOGIN LOKAL SEDERHANA
+  // Tidak menunggu akun Cloud untuk membuka Vault.
   async function unlock() {
     setAuthError('');
 
     if (password.length < 10) {
-      setAuthError('Gunakan password minimal 10 karakter.');
+      setAuthError('Password minimal 10 karakter.');
       return;
     }
 
@@ -122,7 +559,6 @@ function App() {
         };
 
         localStorage.setItem(META_KEY, JSON.stringify(meta));
-
         setAuthMeta(meta);
         setKey(derived);
         setPassword('');
@@ -138,15 +574,17 @@ function App() {
         const valid = await verifyPassword(authMeta.verifier, derived);
 
         if (!valid) {
-          setAuthError('Password salah. Data tetap terkunci.');
-        } else {
-          setKey(derived);
-          setPassword('');
-          await refreshRecords();
+          setAuthError('Password salah. Silakan coba lagi.');
+          return;
         }
+
+        setKey(derived);
+        setPassword('');
+
+        await refreshRecords();
       }
-    } catch (err) {
-      setAuthError(`Gagal membuka vault: ${err.message}`);
+    } catch (error) {
+      setAuthError(`Gagal membuka Vault: ${error.message}`);
     } finally {
       setBusy(false);
     }
@@ -172,9 +610,7 @@ function App() {
     setRecords([]);
     setPreview(null);
 
-    if (previewUrl) {
-      URL.revokeObjectURL(previewUrl);
-    }
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
 
     setPreviewUrl('');
     setSearch('');
@@ -189,7 +625,6 @@ function App() {
     if (!files.length) return;
 
     setBusy(true);
-
     let added = 0;
 
     try {
@@ -207,7 +642,7 @@ function App() {
         const encrypted = await encryptBytes(bytes, key);
         const id = crypto.randomUUID();
 
-        await saveRecord({
+        const encryptedRecord = {
           id,
           name: file.name,
           type,
@@ -216,26 +651,45 @@ function App() {
           createdAt: Date.now(),
           iv: encrypted.iv,
           data: encrypted.data
-        });
+        };
+
+        await saveRecord(encryptedRecord);
+
+        if (cloudSession?.user?.id && !cloudProfileMismatch) {
+          try {
+            if (authMeta) {
+              const remoteMeta = await fetchCloudProfile(cloudSession.user.id);
+
+              if (
+                !remoteMeta ||
+                JSON.stringify(remoteMeta.salt) === JSON.stringify(authMeta.salt)
+              ) {
+                if (!remoteMeta) {
+                  await saveCloudProfile(cloudSession.user.id, authMeta);
+                }
+                await uploadEncryptedRecord(encryptedRecord);
+              }
+            }
+          } catch (error) {
+            setCloudMessage(`File tersimpan lokal. Cloud gagal: ${error.message}`);
+          }
+        }
 
         added++;
       }
 
       await refreshRecords();
 
-      if (added) {
-        setNotice(`${added} file berhasil disimpan terenkripsi.`);
-      } else {
-        setNotice('Tidak ada file foto, video, atau audio yang didukung.');
-      }
-    } catch (err) {
-      setNotice(`Gagal menyimpan file: ${err.message}`);
+      setNotice(
+        added
+          ? `${added} file berhasil disimpan terenkripsi.`
+          : 'Tidak ada file foto, video, atau audio yang didukung.'
+      );
+    } catch (error) {
+      setNotice(`Gagal menyimpan file: ${error.message}`);
     } finally {
       setBusy(false);
-
-      if (fileRef.current) {
-        fileRef.current.value = '';
-      }
+      if (fileRef.current) fileRef.current.value = '';
     }
   }
 
@@ -250,9 +704,7 @@ function App() {
       const blob = new Blob([bytes], { type: record.mime });
       const url = URL.createObjectURL(blob);
 
-      if (previewUrl) {
-        URL.revokeObjectURL(previewUrl);
-      }
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
 
       setPreviewUrl(url);
       setPreview({ ...item, url });
@@ -264,24 +716,43 @@ function App() {
   async function confirmDelete() {
     if (!deleteTarget) return;
 
+    let cloudError = '';
+
+    if (supabase && cloudSession?.user?.id) {
+      const path = `${cloudSession.user.id}/${deleteTarget.id}.bin`;
+
+      const { error: storageError } = await supabase.storage
+        .from('vault-encrypted')
+        .remove([path]);
+
+      if (storageError) cloudError = storageError.message;
+
+      const { error: rowError } = await supabase
+        .from('vault_files')
+        .delete()
+        .eq('id', deleteTarget.id)
+        .eq('user_id', cloudSession.user.id);
+
+      if (rowError) cloudError = rowError.message;
+    }
+
     await deleteRecord(deleteTarget.id);
 
-    setRecords(old =>
-      old.filter(item => item.id !== deleteTarget.id)
-    );
+    setRecords(old => old.filter(item => item.id !== deleteTarget.id));
 
     if (preview?.id === deleteTarget.id) {
       setPreview(null);
-
-      if (previewUrl) {
-        URL.revokeObjectURL(previewUrl);
-      }
-
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
       setPreviewUrl('');
     }
 
     setDeleteTarget(null);
-    setNotice('File berhasil dihapus dari penyimpanan lokal.');
+
+    setNotice(
+      cloudError
+        ? `File lokal dihapus, tetapi penghapusan Cloud gagal: ${cloudError}`
+        : 'File berhasil dihapus.'
+    );
   }
 
   async function exportBackup() {
@@ -317,11 +788,9 @@ function App() {
 
       URL.revokeObjectURL(url);
 
-      setNotice(
-        `Backup terenkripsi berhasil dibuat (${encryptedRecords.length} file).`
-      );
-    } catch (err) {
-      setNotice(`Gagal membuat backup: ${err.message}`);
+      setNotice(`Backup berhasil dibuat (${encryptedRecords.length} file).`);
+    } catch (error) {
+      setNotice(`Gagal membuat backup: ${error.message}`);
     } finally {
       setBusy(false);
     }
@@ -343,15 +812,15 @@ function App() {
 
       const validRecords =
         Array.isArray(backup?.records) &&
-        backup.records.every(r =>
-          r &&
-          typeof r.id === 'string' &&
-          typeof r.name === 'string' &&
-          ['photo', 'video', 'audio'].includes(r.type) &&
-          Number.isFinite(r.size) &&
-          typeof r.iv === 'string' &&
-          typeof r.data === 'string' &&
-          typeof r.mime === 'string'
+        backup.records.every(record =>
+          record &&
+          typeof record.id === 'string' &&
+          typeof record.name === 'string' &&
+          ['photo', 'video', 'audio'].includes(record.type) &&
+          Number.isFinite(record.size) &&
+          typeof record.iv === 'string' &&
+          typeof record.data === 'string' &&
+          typeof record.mime === 'string'
         );
 
       if (
@@ -364,17 +833,14 @@ function App() {
       }
 
       const confirmed = window.confirm(
-        `Pulihkan ${backup.records.length} file dari backup? Data vault yang sekarang akan diganti.`
+        `Pulihkan ${backup.records.length} file dari backup? Data Vault sekarang akan diganti.`
       );
 
       if (!confirmed) return;
 
       await replaceAllRecords(backup.records);
 
-      localStorage.setItem(
-        META_KEY,
-        JSON.stringify(backup.auth)
-      );
+      localStorage.setItem(META_KEY, JSON.stringify(backup.auth));
 
       setAuthMeta(backup.auth);
       setKey(null);
@@ -385,23 +851,26 @@ function App() {
       setAuthError(
         'Backup berhasil dipulihkan. Masuk menggunakan password saat backup dibuat.'
       );
-    } catch (err) {
-      setAuthError(`Gagal memulihkan backup: ${err.message}`);
+    } catch (error) {
+      setAuthError(`Gagal memulihkan backup: ${error.message}`);
     } finally {
       setBusy(false);
-
-      if (backupRef.current) {
-        backupRef.current.value = '';
-      }
+      if (backupRef.current) backupRef.current.value = '';
     }
   }
 
-  // UBAH PASSWORD: enkripsi ulang seluruh file dengan kunci baru.
-  async function changePassword(e) {
-    e.preventDefault();
+  async function changePassword(event) {
+    event.preventDefault();
 
     setPasswordError('');
     setPasswordSuccess('');
+
+    if (cloudProfileMismatch) {
+      setPasswordError(
+        'Akun Cloud terhubung ke Vault berbeda. Keluar dari akun Cloud yang salah sebelum mengubah password.'
+      );
+      return;
+    }
 
     if (!oldPassword || !newPassword || !confirmNewPassword) {
       setPasswordError('Lengkapi semua kolom password.');
@@ -424,18 +893,14 @@ function App() {
     }
 
     setBusy(true);
-
     let originalRecords = [];
 
     try {
       const oldSalt = new Uint8Array(authMeta.salt);
       const oldKey = await deriveKey(oldPassword, oldSalt);
-
       const valid = await verifyPassword(authMeta.verifier, oldKey);
 
-      if (!valid) {
-        throw new Error('Password lama tidak benar.');
-      }
+      if (!valid) throw new Error('Password lama tidak benar.');
 
       originalRecords = await getAllRecords();
 
@@ -479,17 +944,28 @@ function App() {
       }
 
       setAuthMeta(newMeta);
-      setKey(newKey);
 
+      if (cloudSession?.user?.id) {
+        await saveCloudProfile(cloudSession.user.id, newMeta);
+
+        for (const record of convertedRecords) {
+          await uploadEncryptedRecord(record);
+        }
+      }
+
+      setKey(newKey);
       setOldPassword('');
       setNewPassword('');
       setConfirmNewPassword('');
 
-      setPasswordSuccess('Password berhasil diubah. Semua file sudah dienkripsi ulang.');
+      setPasswordSuccess(
+        'Password berhasil diubah. Semua file sudah dienkripsi ulang.'
+      );
+
       setNotice('Password berhasil diperbarui.');
       await refreshRecords();
-    } catch (err) {
-      setPasswordError(`Gagal mengubah password: ${err.message}`);
+    } catch (error) {
+      setPasswordError(`Gagal mengubah password: ${error.message}`);
     } finally {
       setBusy(false);
     }
@@ -519,11 +995,12 @@ function App() {
   }, [records, activeTab, search]);
 
   const counts = useMemo(() => ({
-    photo: records.filter(x => x.type === 'photo').length,
-    video: records.filter(x => x.type === 'video').length,
-    audio: records.filter(x => x.type === 'audio').length
+    photo: records.filter(item => item.type === 'photo').length,
+    video: records.filter(item => item.type === 'video').length,
+    audio: records.filter(item => item.type === 'audio').length
   }), [records]);
 
+  // LOGIN SEDERHANA: PASSWORD VAULT SAJA
   if (!key) {
     return (
       <main className="auth-shell">
@@ -532,32 +1009,32 @@ function App() {
             <FolderLock size={28} />
           </div>
 
-          <div className="eyebrow">
-            PERSONAL STORAGE · OFFLINE
-          </div>
+          <div className="eyebrow">PRIVATE VAULT</div>
 
           <h1>
-            {isSetup ? 'Buat vault pribadi' : 'Selamat datang kembali'}
+            {isSetup ? 'Buat Vault Pribadi' : 'Selamat Datang'}
           </h1>
 
           <p className="muted">
             {isSetup
-              ? 'Buat password utama untuk mengenkripsi dan mengunci semua file.'
-              : 'Masukkan password utama untuk membuka koleksi terenkripsi.'}
+              ? 'Buat password untuk mengamankan file pribadi kamu.'
+              : 'Masukkan password untuk membuka Vault.'}
           </p>
 
-          <form onSubmit={e => {
-            e.preventDefault();
-            unlock();
-          }}>
-            <label>Password utama</label>
+          <form
+            onSubmit={event => {
+              event.preventDefault();
+              unlock();
+            }}
+          >
+            <label>Password</label>
 
             <div className="password-wrap">
               <input
                 autoFocus
                 type={showPassword ? 'text' : 'password'}
                 value={password}
-                onChange={e => setPassword(e.target.value)}
+                onChange={event => setPassword(event.target.value)}
                 placeholder="Minimal 10 karakter"
                 autoComplete={isSetup ? 'new-password' : 'current-password'}
               />
@@ -574,103 +1051,42 @@ function App() {
 
             {isSetup && (
               <>
-                <label>Ulangi password</label>
+                <label>Konfirmasi Password</label>
+
                 <input
                   type={showPassword ? 'text' : 'password'}
                   value={confirm}
-                  onChange={e => setConfirm(e.target.value)}
-                  placeholder="Masukkan ulang password"
+                  onChange={event => setConfirm(event.target.value)}
+                  placeholder="Ulangi password"
                   autoComplete="new-password"
                 />
               </>
             )}
 
-            {authError && (
-              <div className="error">{authError}</div>
-            )}
+            {authError && <div className="error">{authError}</div>}
 
-            <button className="primary full" disabled={busy}>
+            <button
+              className="primary full"
+              type="submit"
+              disabled={busy}
+            >
               {busy
                 ? 'Memproses...'
                 : isSetup
-                  ? 'Buat Private Vault'
-                  : 'Buka Vault'}
+                  ? 'Buat Vault'
+                  : 'Masuk'}
+
               <LockKeyhole size={17} />
             </button>
           </form>
-
-          <div className="security-note">
-            <ShieldCheck size={17} />
-            <span>
-              Password tidak disimpan. File dienkripsi sebelum masuk ke penyimpanan browser.
-            </span>
-          </div>
-
-          {!isSetup && (
-            <div className="recovery-area">
-              <button
-                className="text-button"
-                type="button"
-                onClick={() => setShowRecoveryInfo(!showRecoveryInfo)}
-              >
-                Lupa password?
-              </button>
-
-              {showRecoveryInfo && (
-                <div className="recovery-panel">
-                  <div className="recovery-panel-title">
-                    <AlertTriangle size={18} />
-                    Password tidak dapat di-reset
-                  </div>
-
-                  <p>
-                    File vault dienkripsi menggunakan password utama.
-                    Jika password hilang, file tidak bisa dibuka hanya
-                    dengan mengganti password.
-                  </p>
-
-                  <p>
-                    Jika kamu memiliki backup <b>.pvault</b>, pulihkan
-                    melalui tombol di bawah dan gunakan password yang
-                    dipakai saat backup dibuat.
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
-
-          <div className="auth-backup-tools">
-            <input
-              ref={backupRef}
-              type="file"
-              hidden
-              accept=".pvault,application/json"
-              onChange={e => importBackup(e.target.files?.[0])}
-            />
-
-            <button
-              className="secondary full"
-              type="button"
-              onClick={() => backupRef.current?.click()}
-              disabled={busy}
-            >
-              <HardDrive size={17} />
-              Pulihkan dari backup
-            </button>
-
-            <small>
-              Pilih file .pvault yang pernah kamu ekspor. Password backup tetap diperlukan.
-            </small>
-          </div>
         </div>
 
-        <div className="auth-footer">
-          PRIVATE VAULT <span>•</span> DATA TETAP DI PERANGKAT INI
-        </div>
+        <div className="auth-footer">PRIVATE VAULT</div>
       </main>
     );
   }
 
+  // DASHBOARD VAULT
   return (
     <div className={`app-shell ${sidebarOpen ? 'sidebar-expanded' : 'sidebar-collapsed'}`}>
       <aside className={`sidebar ${sidebarOpen ? 'sidebar-open' : 'sidebar-closed'}`}>
@@ -680,8 +1096,8 @@ function App() {
           </div>
 
           <div className="brand-text">
-            <b>           </b>
-            <small>          </small>
+            <b>PRIVATE VAULT</b>
+            <small>Personal Storage</small>
           </div>
 
           <button
@@ -693,8 +1109,7 @@ function App() {
           >
             {sidebarOpen
               ? <PanelLeftClose size={19} />
-              : <PanelLeftOpen size={19} />
-            }
+              : <PanelLeftOpen size={19} />}
           </button>
         </div>
 
@@ -723,10 +1138,14 @@ function App() {
         <div className="sidebar-bottom">
           <div className="local-card">
             <HardDrive size={18} />
+
             <div className="local-card-text">
-              <b>Penyimpanan lokal</b>
-              <small>Browser perangkat ini</small>
+              <b>{cloudSession ? 'Cloud + lokal' : 'Penyimpanan lokal'}</b>
+              <small>
+                {cloudSession ? 'Akun tersambung' : 'Browser perangkat ini'}
+              </small>
             </div>
+
             <span className="live-dot" />
           </div>
 
@@ -787,7 +1206,7 @@ function App() {
               hidden
               multiple
               accept="image/*,video/*,audio/*"
-              onChange={e => addFiles(e.target.files)}
+              onChange={event => addFiles(event.target.files)}
             />
           </div>
         </header>
@@ -795,19 +1214,23 @@ function App() {
         <section className="welcome-panel">
           <div>
             <div className="eyebrow light">YOUR PRIVATE SPACE</div>
+
             <h2>
               Simpan yang berarti.
               <br />
               <span>Jaga tetap pribadi.</span>
             </h2>
+
             <p>
-              Foto, video, dan audio tersimpan terenkripsi di perangkat ini.
+              Foto, video, dan audio tersimpan terenkripsi di perangkat
+              {cloudSession ? ' dan disinkronkan ke Cloud.' : ' ini.'}
             </p>
           </div>
 
           <div className="panel-art">
             <div className="orb orb-one" />
             <div className="orb orb-two" />
+
             <div className="vault-graphic">
               <FolderLock size={58} />
               <span />
@@ -834,36 +1257,73 @@ function App() {
                       ? 'Video'
                       : 'Audio'}
               </h2>
+
               <p>{filtered.length} item dalam koleksi</p>
             </div>
 
             <div className="search-box">
               <Search size={17} />
+
               <input
                 value={search}
-                onChange={e => setSearch(e.target.value)}
+                onChange={event => setSearch(event.target.value)}
                 placeholder="Cari nama file..."
               />
             </div>
           </div>
 
           {busy && (
-            <div className="progress-note">
-              Sedang memproses data...
-            </div>
+            <div className="progress-note">Sedang memproses data...</div>
           )}
 
           {filtered.length ? (
-            <div className="media-grid media-gallery">
-              {filtered.map(item => (
-                <MediaCard
-                  key={item.id}
-                  item={item}
-                  vaultKey={key}
-                  onOpen={() => openPreview(item)}
-                  onDelete={() => setDeleteTarget(item)}
-                />
-              ))}
+            <div className="media-gallery-shell">
+              <button
+                className="gallery-arrow gallery-arrow-left"
+                type="button"
+                aria-label="Geser galeri ke kiri"
+                title="Geser ke kiri"
+                onClick={() => moveGallery(-1)}
+              >
+                ‹
+              </button>
+
+              <div
+                className="media-grid media-gallery"
+                id="private-vault-gallery"
+                ref={galleryRef}
+                onPointerDown={handleGalleryPointerDown}
+                onPointerMove={handleGalleryPointerMove}
+                onPointerUp={handleGalleryPointerEnd}
+                onPointerCancel={handleGalleryPointerEnd}
+                onClickCapture={handleGalleryClickCapture}
+                onKeyDown={event => {
+                  if (event.key === 'ArrowRight') moveGallery(1);
+                  if (event.key === 'ArrowLeft') moveGallery(-1);
+                }}
+                tabIndex={0}
+                aria-label="Galeri foto, video, dan audio."
+              >
+                {filtered.map(item => (
+                  <MediaCard
+                    key={item.id}
+                    item={item}
+                    vaultKey={key}
+                    onOpen={() => openPreview(item)}
+                    onDelete={() => setDeleteTarget(item)}
+                  />
+                ))}
+              </div>
+
+              <button
+                className="gallery-arrow gallery-arrow-right"
+                type="button"
+                aria-label="Geser galeri ke kanan"
+                title="Geser ke kanan"
+                onClick={() => moveGallery(1)}
+              >
+                ›
+              </button>
             </div>
           ) : (
             <div className="empty-state">
@@ -897,7 +1357,12 @@ function App() {
             <ShieldCheck size={14} />
             AES-256-GCM ENCRYPTION
           </span>
-          <span>Data hanya tersimpan di browser ini</span>
+
+          <span>
+            {cloudSession
+              ? 'Ciphertext tersimpan lokal dan Cloud'
+              : 'Data tersimpan di browser ini'}
+          </span>
         </footer>
       </main>
 
@@ -912,7 +1377,7 @@ function App() {
         <div className="modal-backdrop" onClick={closeSettings}>
           <div
             className="settings-modal"
-            onClick={e => e.stopPropagation()}
+            onClick={event => event.stopPropagation()}
           >
             <div className="settings-header">
               <div className="settings-heading-icon">
@@ -936,36 +1401,43 @@ function App() {
             <div className="settings-section">
               <div className="settings-section-title">
                 <KeyRound size={19} />
+
                 <div>
                   <b>Keamanan password</b>
-                  <small>Perbarui password utama vault.</small>
+                  <small>Perbarui password utama Vault.</small>
                 </div>
               </div>
 
-              <form onSubmit={changePassword} className="change-password-form">
+              <form
+                onSubmit={changePassword}
+                className="change-password-form"
+              >
                 <label>Password lama</label>
+
                 <input
                   type={showChangePasswords ? 'text' : 'password'}
                   value={oldPassword}
-                  onChange={e => setOldPassword(e.target.value)}
+                  onChange={event => setOldPassword(event.target.value)}
                   placeholder="Masukkan password saat ini"
                   autoComplete="current-password"
                 />
 
                 <label>Password baru</label>
+
                 <input
                   type={showChangePasswords ? 'text' : 'password'}
                   value={newPassword}
-                  onChange={e => setNewPassword(e.target.value)}
+                  onChange={event => setNewPassword(event.target.value)}
                   placeholder="Minimal 10 karakter"
                   autoComplete="new-password"
                 />
 
                 <label>Konfirmasi password baru</label>
+
                 <input
                   type={showChangePasswords ? 'text' : 'password'}
                   value={confirmNewPassword}
-                  onChange={e => setConfirmNewPassword(e.target.value)}
+                  onChange={event => setConfirmNewPassword(event.target.value)}
                   placeholder="Ulangi password baru"
                   autoComplete="new-password"
                 />
@@ -975,8 +1447,13 @@ function App() {
                   className="text-button settings-show-password"
                   onClick={() => setShowChangePasswords(!showChangePasswords)}
                 >
-                  {showChangePasswords ? <EyeOff size={15} /> : <Eye size={15} />}
-                  {showChangePasswords ? 'Sembunyikan password' : 'Tampilkan password'}
+                  {showChangePasswords
+                    ? <EyeOff size={15} />
+                    : <Eye size={15} />}
+
+                  {showChangePasswords
+                    ? 'Sembunyikan password'
+                    : 'Tampilkan password'}
                 </button>
 
                 {passwordError && (
@@ -992,6 +1469,7 @@ function App() {
 
                 <div className="password-warning">
                   <AlertTriangle size={17} />
+
                   <span>
                     Sebelum mengubah password, buat backup terlebih dahulu.
                     Proses ini akan mengenkripsi ulang seluruh file.
@@ -1019,12 +1497,106 @@ function App() {
               </form>
             </div>
 
+            <div className="settings-section cloud-settings-section">
+              <div className="settings-section-title">
+                <ShieldCheck size={19} />
+
+                <div>
+                  <b>Akun dan sinkronisasi Cloud</b>
+                  <small>
+                    File dienkripsi di perangkat sebelum diunggah.
+                  </small>
+                </div>
+              </div>
+
+              {cloudSession ? (
+                <>
+                  <p className="cloud-account-email">
+                    Terhubung sebagai <b>{cloudSession.user.email}</b>
+                  </p>
+
+                  <div className="cloud-auth-actions">
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={syncCloudFiles}
+                      disabled={cloudSyncBusy || busy}
+                    >
+                      {cloudSyncBusy
+                        ? 'Menyinkronkan...'
+                        : 'Sinkronkan sekarang'}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={signOutCloud}
+                    >
+                      Keluar akun
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <form
+                  className="cloud-auth-form"
+                  onSubmit={signInCloud}
+                >
+                  <input
+                    type="email"
+                    value={cloudEmail}
+                    onChange={event => setCloudEmail(event.target.value)}
+                    placeholder="Email akun Cloud"
+                    required
+                  />
+
+                  <input
+                    type="password"
+                    value={cloudPassword}
+                    onChange={event => setCloudPassword(event.target.value)}
+                    placeholder="Password akun Cloud"
+                    required
+                  />
+
+                  <div className="cloud-auth-actions">
+                    <button
+                      className="primary"
+                      disabled={cloudAuthBusy}
+                    >
+                      {cloudAuthBusy ? 'Memproses...' : 'Masuk akun'}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={cloudAuthBusy}
+                      onClick={signUpCloud}
+                    >
+                      Buat akun
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {cloudMessage && (
+                <p className="cloud-message">{cloudMessage}</p>
+              )}
+
+              <p className="cloud-security-copy">
+                Jangan samakan password akun Cloud dengan password utama
+                Vault. Supabase hanya menerima file terenkripsi.
+              </p>
+            </div>
+
             <div className="settings-info">
               <HardDrive size={18} />
+
               <div>
                 <b>Penyimpanan lokal</b>
+
                 <small>
-                  File disimpan di browser perangkat ini, bukan di server cloud.
+                  Salinan lokal tetap ada. Jika akun Cloud tersambung,
+                  ciphertext juga disimpan di Cloud agar bisa diunduh
+                  pada perangkat lain.
                 </small>
               </div>
             </div>
@@ -1039,7 +1611,7 @@ function App() {
         >
           <div
             className="preview-modal"
-            onClick={e => e.stopPropagation()}
+            onClick={event => event.stopPropagation()}
           >
             <div className="modal-head">
               <div>
@@ -1075,7 +1647,7 @@ function App() {
         >
           <div
             className="confirm-modal"
-            onClick={e => e.stopPropagation()}
+            onClick={event => event.stopPropagation()}
           >
             <div className="danger-icon">
               <Trash2 />
@@ -1084,7 +1656,8 @@ function App() {
             <h3>Hapus file ini?</h3>
 
             <p>
-              <b>{deleteTarget.name}</b> akan dihapus permanen dari penyimpanan browser.
+              <b>{deleteTarget.name}</b> akan dihapus permanen
+              dari penyimpanan browser dan Cloud jika tersambung.
             </p>
 
             <div className="modal-actions">
@@ -1115,6 +1688,7 @@ function Stat({ icon: Icon, label, count, color }) {
       <div className={`stat-icon ${color}`}>
         <Icon size={20} />
       </div>
+
       <div>
         <small>{label}</small>
         <strong>{count}</strong>
@@ -1136,10 +1710,9 @@ function MediaCard({ item, vaultKey, onOpen, onDelete }) {
         ? FileVideo
         : FileAudio;
 
-  // Decrypt only when the card approaches the visible gallery area.
-  // Plaintext thumbnails exist only as temporary browser object URLs.
   useEffect(() => {
     const node = cardRef.current;
+
     if (!node) {
       setIsVisible(true);
       return;
@@ -1157,7 +1730,11 @@ function MediaCard({ item, vaultKey, onOpen, onDelete }) {
           observer.disconnect();
         }
       },
-      { root: null, rootMargin: '240px', threshold: 0.01 }
+      {
+        root: null,
+        rootMargin: '240px',
+        threshold: 0.01
+      }
     );
 
     observer.observe(node);
@@ -1175,12 +1752,15 @@ function MediaCard({ item, vaultKey, onOpen, onDelete }) {
 
       try {
         const rows = await getAllRecords();
+
         if (cancelled) return;
 
         const record = rows.find(row => row.id === item.id);
+
         if (!record) throw new Error('File tidak ditemukan');
 
         const bytes = await decryptBytes(record, vaultKey);
+
         if (cancelled) return;
 
         const blob = new Blob([bytes], {
@@ -1190,15 +1770,14 @@ function MediaCard({ item, vaultKey, onOpen, onDelete }) {
         sourceUrl = URL.createObjectURL(blob);
 
         if (item.type === 'photo') {
-          if (cancelled) return;
           setThumbnailUrl(sourceUrl);
           sourceUrl = '';
           setThumbnailState('ready');
           return;
         }
 
-        // Extract one frame from the decrypted video in memory.
         const video = document.createElement('video');
+
         video.muted = true;
         video.playsInline = true;
         video.preload = 'auto';
@@ -1210,14 +1789,17 @@ function MediaCard({ item, vaultKey, onOpen, onDelete }) {
               cleanup();
               resolve();
             };
+
             const onError = () => {
               cleanup();
               reject(new Error('Browser tidak dapat membaca video ini.'));
             };
+
             const cleanup = () => {
               target.removeEventListener(eventName, onReady);
               target.removeEventListener(errorName, onError);
             };
+
             target.addEventListener(eventName, onReady, { once: true });
             target.addEventListener(errorName, onError, { once: true });
           });
@@ -1230,15 +1812,15 @@ function MediaCard({ item, vaultKey, onOpen, onDelete }) {
           return;
         }
 
-        // Move slightly into the video when possible so the frame is not black.
         if (Number.isFinite(video.duration) && video.duration > 0.15) {
           const seekTime = Math.min(0.15, video.duration / 2);
           const seekPromise = waitFor(video, 'seeked');
+
           try {
             video.currentTime = seekTime;
             await seekPromise;
           } catch {
-            // Keep the first decoded frame if seeking is unsupported.
+            // Gunakan frame pertama jika seek gagal.
           }
         }
 
@@ -1250,13 +1832,15 @@ function MediaCard({ item, vaultKey, onOpen, onDelete }) {
 
         const width = video.videoWidth || 640;
         const height = video.videoHeight || 360;
-        const maxDimension = 960;
-        const scale = Math.min(1, maxDimension / Math.max(width, height));
+        const scale = Math.min(1, 960 / Math.max(width, height));
+
         const canvas = document.createElement('canvas');
+
         canvas.width = Math.max(1, Math.round(width * scale));
         canvas.height = Math.max(1, Math.round(height * scale));
 
         const context = canvas.getContext('2d');
+
         if (!context) throw new Error('Canvas tidak tersedia.');
 
         context.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -1269,7 +1853,9 @@ function MediaCard({ item, vaultKey, onOpen, onDelete }) {
         video.removeAttribute('src');
         video.load();
 
-        if (!thumbnailBlob) throw new Error('Gagal membuat thumbnail video.');
+        if (!thumbnailBlob) {
+          throw new Error('Gagal membuat thumbnail video.');
+        }
 
         const frameUrl = URL.createObjectURL(thumbnailBlob);
 
@@ -1280,7 +1866,7 @@ function MediaCard({ item, vaultKey, onOpen, onDelete }) {
 
         setThumbnailUrl(frameUrl);
         setThumbnailState('ready');
-      } catch (error) {
+      } catch {
         if (!cancelled) setThumbnailState('error');
       } finally {
         if (sourceUrl) URL.revokeObjectURL(sourceUrl);
@@ -1327,7 +1913,9 @@ function MediaCard({ item, vaultKey, onOpen, onDelete }) {
           <div className="file-art photo-art">
             <ImageIcon size={34} />
             <span className="thumbnail-status">
-              {thumbnailState === 'loading' ? 'Memuat foto...' : 'Preview tidak tersedia'}
+              {thumbnailState === 'loading'
+                ? 'Memuat foto...'
+                : 'Preview tidak tersedia'}
             </span>
           </div>
         ) : item.type === 'video' ? (
@@ -1335,12 +1923,15 @@ function MediaCard({ item, vaultKey, onOpen, onDelete }) {
             <Video size={36} />
             <span className="play-dot">▶</span>
             <span className="thumbnail-status">
-              {thumbnailState === 'loading' ? 'Memuat cuplikan...' : 'Preview tidak tersedia'}
+              {thumbnailState === 'loading'
+                ? 'Memuat cuplikan...'
+                : 'Preview tidak tersedia'}
             </span>
           </div>
         ) : (
           <div className="file-art audio-art">
             <Music2 size={38} />
+
             <div className="wave">
               <i /><i /><i /><i /><i /><i /><i /><i /><i />
             </div>
@@ -1350,6 +1941,7 @@ function MediaCard({ item, vaultKey, onOpen, onDelete }) {
         {item.type === 'video' && thumbnailUrl && (
           <span className="video-play-overlay">▶</span>
         )}
+
         <span className="open-hint">Buka preview</span>
       </button>
 
